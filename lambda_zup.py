@@ -2,6 +2,7 @@ from __future__ import division
 import serial
 import time
 import re
+import threading
 
 class LambdaZup(object):
     """ TDK-Lambda Zup Programmable DC Power Supply
@@ -16,6 +17,8 @@ class LambdaZup(object):
         self.address = address
         self.debug =debug
         self.always_send_address = always_send_address
+        
+        self.lock = threading.RLock()
 
         
         """If port is a Serial object (or other file-like object)
@@ -25,30 +28,39 @@ class LambdaZup(object):
             self.port = None
         else:        
             self.ser = serial.Serial(self.port, baudrate = 9600, bytesize=8, parity='N', 
-                    stopbits=1, xonxoff=1, rtscts=0, timeout=0.1)
-                    
-                    
+                    stopbits=1, xonxoff=1, rtscts=0, timeout=0.5)
+        
+        #if not self.always_send_address:
+        self.set_address()
+        
+        self.get_software_revision()
+        
+    def close(self):
+        self.ser.close()
+        
     def _write(self, cmd):
         assert cmd[0] == ':'
         assert cmd[-1] == ';'
         
-        if self.always_send_address:
-            if self.debug: "sending address", self.address
-            self.ser.write(":ADR%02i;" % self.address)
-            time.sleep(0.05)
-        
-        if self.debug: print "write: ", cmd
-        
-        self.ser.write(cmd)
+        with self.lock:
+            if self.always_send_address:
+                if self.debug: "sending address", self.address
+                adrcmd = ":ADR%02i;" % self.address
+                self.ser.write(adrcmd.encode())
+                time.sleep(0.050)
+            
+            if self.debug: print( "write: ", cmd)
+            
+            self.ser.write(cmd.encode())
 
     def _ask(self, cmd):
         "call and response via serial port"
-        self._write(cmd)
-        
-        time.sleep(0.05)
-        resp = self.ser.readline()
+        with self.lock:
+            self._write(cmd)
+            #time.sleep(0.010)
+            resp = self.ser.readline().decode()
         resp = resp.rstrip()  #strip end of line characters "\r\n"
-        if self.debug: print "ask response:", repr(resp)
+        if self.debug: print("ask response:", repr(resp))
         return resp
         
         
@@ -68,7 +80,9 @@ class LambdaZup(object):
         assert 0 < adr < 32
         
         self._write(":ADR%02i;" % adr)
+        time.sleep(0.050)
         self.address = adr
+        
         return self.address
     
     def clear_comm_buffer(self):
@@ -79,7 +93,7 @@ class LambdaZup(object):
         """
         self._write(":DCL;")
         
-    def set_remote_mode(mode=0):
+    def set_remote_mode(self, mode=0):
         """
         Sets the power supply to local or remote mode. (This command is active when the
             unit is either in Local or Remote modes).Transition from Local to Remote mode
@@ -136,7 +150,7 @@ class LambdaZup(object):
         ver, maxV, maxA, revision = out.replace('-', ' ').split()
         
         self.max_voltage = int(maxV)
-        self.max_current = int(maxA)
+        self.max_current = float(maxA)
         self.software_revision = revision
         
         return self.software_revision    
@@ -156,7 +170,7 @@ class LambdaZup(object):
         ZUP36-XY 	00.00	36.00
         ZUP60-XY 	00.00	60.00
         ZUP80-XY 	00.00	80.00
-        ZUP120-XY 	00.000	120.00
+        ZUP120-XY 	000.00	120.00
         Table 5-1: Voltage programming range. Example - ZUP6-XY :VOL5.010;
         
         Note:
@@ -164,8 +178,9 @@ class LambdaZup(object):
         ZUP10-XY :VOL08.500;
         """
         assert 0 <= volt <= self.max_voltage
-        self._write(":VOL%0.2f;" % volt)
-        #TODO: this only has the correct decimal points for ZUP6
+
+        fmt_str = v_format_strs[self.max_voltage]
+        self._write(":VOL{};".format(fmt_str).format(volt))
     
     def get_voltage_setp(self):
         """ Returns the string SV(Set Voltage) followed by the present programmed output 
@@ -230,8 +245,11 @@ class LambdaZup(object):
         """
         
         assert 0 <= amp <= self.max_current
-        self._write(":CUR%2.2f;" % amp)
-        #TODO: this only has the correct decimal points for ZUP6-33
+        # this only has the correct decimal points for ZUP6-33
+        # self._write(":CUR%02.3f;" % amp)
+        
+        fmt_str = i_format_strs[(self.max_voltage, self.max_current)]
+        self._write(":CUR{};".format(fmt_str).format(amp))
         
     def get_current_setp(self):
         """
@@ -581,6 +599,49 @@ class LambdaZup(object):
     
     #TODO interrupts not implemented yet
 
+
+######### Format Strings for settings voltage and current
+# we need these because Zup requires the correct number of digits
+# depending on model
+v_format_strs = {
+    # key: volt max
+    # value: format string {:0total_char.decimalsf}
+    6: "{:05.3f}",
+    10:"{:06.3f}",
+    20:"{:06.3f}", 
+    36:"{:05.2f}",
+    60:"{:05.2f}",
+    80:"{:05.2f}",
+    120:"{:06.2f}"}
+
+i_format_strs = {
+    #(V,A): fmt_str {:0total_char.decimalsf}
+    (6,33.0):   "{:05.2f}",
+    (6,66.0):   "{:05.2f}",
+    (6,132.0):  "{:06.2f}",
+    
+    (10,20.0):  "{:06.3f}",
+    (10,40.0):  "{:05.2f}",
+    (10,80.0):  "{:05.2f}",
+    
+    (20,10.0):  "{:06.3f}",
+    (20,20.0):  "{:06.3f}",
+    (20,40.0):  "{:05.2f}",
+    
+    (36,6.0):   "{:05.3f}",
+    (36,12.0):  "{:06.3f}",
+    (36,24.0):  "{:06.3f}",
+    
+    (60,3.5):   "{:05.3f}",
+    (60,7.0):   "{:05.3f}",
+    (60,14.0):  "{:06.3f}",
+    
+    (80,2.5):   "{:06.4f}",
+    (80,5.0):   "{:05.3f}",
+    
+    (120,1.8):   "{:06.4f}",
+    (120,3.6):   "{:05.3f}",
+}
 
 ### Test case
 

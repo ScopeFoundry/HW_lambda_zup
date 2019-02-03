@@ -1,4 +1,4 @@
-from lambda_zup import LambdaZup
+from .lambda_zup import LambdaZup
 from pprint import pprint
 
 test_port = "COM3"
